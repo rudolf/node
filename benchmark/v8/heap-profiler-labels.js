@@ -6,7 +6,7 @@ const common = require('../common.js');
 const v8 = require('v8');
 
 const bench = common.createBenchmark(main, {
-  mode: ['none', 'sampling', 'sampling-with-labels'],
+  mode: ['none', 'sampling', 'sampling-with-labels', 'sampling-with-groups'],
   n: [1e6],
 });
 
@@ -18,9 +18,13 @@ function main({ mode, n }) {
     handle = v8.startHeapProfile({ sampleInterval: interval });
   } else if (mode === 'sampling-with-labels') {
     handle = v8.startHeapProfile({ labels: true, sampleInterval: interval });
+  } else if (mode === 'sampling-with-groups') {
+    handle = v8.startHeapProfile({
+      labels: true, groupBy: ['route'], sampleInterval: interval,
+    });
   }
 
-  if (mode === 'sampling-with-labels') {
+  if (mode === 'sampling-with-labels' || mode === 'sampling-with-groups') {
     v8.withHeapProfileLabels({ route: '/bench' }, () => {
       runWorkload(n);
     });

@@ -12,7 +12,7 @@ const http = require('http');
 const DB_PORT = PORT + 1;
 
 const bench = common.createBenchmark(main, {
-  mode: ['none', 'sampling', 'sampling-with-labels'],
+  mode: ['none', 'sampling', 'sampling-with-labels', 'sampling-with-groups'],
   rows: [100, 1000],
   c: [50],
   duration: 10,
@@ -98,6 +98,10 @@ function main({ mode, rows, c, duration }) {
       handle = v8.startHeapProfile({ sampleInterval: interval });
     } else if (mode === 'sampling-with-labels') {
       handle = v8.startHeapProfile({ labels: true, sampleInterval: interval });
+    } else if (mode === 'sampling-with-groups') {
+      handle = v8.startHeapProfile({
+        labels: true, groupBy: ['route'], sampleInterval: interval,
+      });
     }
 
     const appServer = http.createServer((req, res) => {
@@ -112,7 +116,7 @@ function main({ mode, rows, c, duration }) {
         res.end(body);
       };
 
-      if (mode === 'sampling-with-labels') {
+      if (mode === 'sampling-with-labels' || mode === 'sampling-with-groups') {
         v8.withHeapProfileLabels({ route: req.url }, handler);
       } else {
         handler();
