@@ -26,6 +26,7 @@
 #include "memory_tracker-inl.h"
 #include "node.h"
 #include "node_external_reference.h"
+#include "node_heap_profile_labels.h"
 #include "node_profiling.h"
 #include "permission/permission.h"
 #include "util-inl.h"
@@ -34,6 +35,8 @@
 
 namespace node {
 namespace v8_utils {
+using heap_profile_labels::HeapProfileSession;
+using heap_profile_labels::LabelRegistry;
 using v8::Array;
 using v8::BigInt;
 using v8::CFunction;
@@ -144,6 +147,14 @@ BindingData::BindingData(Realm* realm,
   heap_statistics_buffer.MakeWeak();
   heap_space_statistics_buffer.MakeWeak();
   heap_code_statistics_buffer.MakeWeak();
+}
+
+BindingData::~BindingData() {
+  // The session holds references into heap_profile_labels, so it goes first.
+  Isolate* isolate = realm()->isolate();
+  if (HeapProfileSession::Destroy(isolate, this)) {
+    isolate->GetHeapProfiler()->StopSamplingHeapProfiler();
+  }
 }
 
 bool BindingData::PrepareForSerialization(Local<Context> context,
@@ -292,22 +303,44 @@ void StopCpuProfile(const FunctionCallbackInfo<Value>& args) {
 }
 
 void StartHeapProfile(const FunctionCallbackInfo<Value>& args) {
-  Isolate* isolate = args.GetIsolate();
+  Environment* env = Environment::GetCurrent(args);
+  Isolate* isolate = env->isolate();
+  BindingData* binding_data = Realm::GetBindingData<BindingData>(args);
   auto options = ParseHeapProfileOptions(args);
-
-  if (isolate->GetHeapProfiler()->StartSamplingHeapProfiler(
-          options.sample_interval, options.stack_depth, options.flags)) {
-    return;
+  LabelRegistry* registry = nullptr;
+  if (args[3]->IsTrue()) {
+    registry = binding_data->heap_profile_labels.get();
+    CHECK_NOT_NULL(registry);
   }
-  THROW_ERR_HEAP_PROFILE_HAVE_BEEN_STARTED(isolate,
-                                           "Heap profile has been started");
+
+  if (!isolate->GetHeapProfiler()->StartSamplingHeapProfiler(
+          options.sample_interval,
+          options.stack_depth,
+          options.flags,
+          registry != nullptr ? HeapProfileSession::ExtractSampleContext
+                              : nullptr)) {
+    return THROW_ERR_HEAP_PROFILE_HAVE_BEEN_STARTED(
+        isolate, "Heap profile has been started");
+  }
+  HeapProfileSession* session = HeapProfileSession::Start(
+      isolate, binding_data, registry, env->isolate_data()->node_allocator());
+  args.GetReturnValue().Set(session->id());
+}
+
+// Returns whether args[0] identifies the current session.
+static bool IsCurrentHeapProfile(const FunctionCallbackInfo<Value>& args) {
+  CHECK(args[0]->IsUint32());
+  HeapProfileSession* session = HeapProfileSession::Get(args.GetIsolate());
+  return session != nullptr && session->id() == args[0].As<Uint32>()->Value();
 }
 
 void StopHeapProfile(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
   Isolate* isolate = env->isolate();
+  if (!IsCurrentHeapProfile(args)) return;
   std::ostringstream out_stream;
   bool success = node::SerializeHeapProfile(isolate, out_stream);
+  HeapProfileSession::Destroy(isolate);
   if (success) {
     Local<Value> result;
     if (ToV8Value(env->context(), out_stream.str(), isolate).ToLocal(&result)) {
@@ -315,6 +348,36 @@ void StopHeapProfile(const FunctionCallbackInfo<Value>& args) {
     }
   } else {
     THROW_ERR_HEAP_PROFILE_NOT_STARTED(isolate, "heap profile not started");
+  }
+}
+
+void GetAllocationProfile(const FunctionCallbackInfo<Value>& args) {
+  if (!IsCurrentHeapProfile(args)) return;
+  Local<Value> profile;
+  if (HeapProfileSession::Get(args.GetIsolate())
+          ->GetAllocationProfile(args.GetIsolate()->GetCurrentContext())
+          .ToLocal(&profile)) {
+    args.GetReturnValue().Set(profile);
+  }
+}
+
+void SetHeapProfileLabelsStore(const FunctionCallbackInfo<Value>& args) {
+  BindingData* binding_data = Realm::GetBindingData<BindingData>(args);
+  CHECK_NULL(binding_data->heap_profile_labels);
+  binding_data->heap_profile_labels =
+      std::make_unique<LabelRegistry>(args.GetIsolate());
+  binding_data->heap_profile_labels->set_als_key(args[0]);
+}
+
+void PrepareHeapProfileLabelsHolder(const FunctionCallbackInfo<Value>& args) {
+  BindingData* binding_data = Realm::GetBindingData<BindingData>(args);
+  CHECK(args[0]->IsArray());
+  Local<Object> holder;
+  if (binding_data->heap_profile_labels
+          ->GetHolder(args.GetIsolate()->GetCurrentContext(),
+                      args[0].As<Array>())
+          .ToLocal(&holder)) {
+    args.GetReturnValue().Set(holder);
   }
 }
 
@@ -782,6 +845,13 @@ void Initialize(Local<Object> target,
   SetMethod(context, target, "stopCpuProfile", StopCpuProfile);
   SetMethod(context, target, "startHeapProfile", StartHeapProfile);
   SetMethod(context, target, "stopHeapProfile", StopHeapProfile);
+  SetMethod(context, target, "getAllocationProfile", GetAllocationProfile);
+  SetMethod(
+      context, target, "setHeapProfileLabelsStore", SetHeapProfileLabelsStore);
+  SetMethod(context,
+            target,
+            "prepareHeapProfileLabelsHolder",
+            PrepareHeapProfileLabelsHolder);
 
   {
     constexpr uint32_t kSamplingNoFlags = static_cast<uint32_t>(
@@ -849,6 +919,9 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(StopCpuProfile);
   registry->Register(StartHeapProfile);
   registry->Register(StopHeapProfile);
+  registry->Register(GetAllocationProfile);
+  registry->Register(SetHeapProfileLabelsStore);
+  registry->Register(PrepareHeapProfileLabelsHolder);
 }
 
 }  // namespace v8_utils

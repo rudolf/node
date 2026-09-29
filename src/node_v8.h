@@ -8,6 +8,7 @@
 #include "base_object.h"
 #include "json_utils.h"
 #include "node_errors.h"
+#include "node_heap_profile_labels.h"
 #include "node_snapshotable.h"
 #include "util.h"
 #include "v8.h"
@@ -27,6 +28,7 @@ class BindingData : public SnapshotableObject {
   BindingData(Realm* realm,
               v8::Local<v8::Object> obj,
               InternalFieldInfo* info = nullptr);
+  ~BindingData() override;
 
   SERIALIZABLE_OBJECT_METHODS()
   SET_BINDING_ID(v8_binding_data)
@@ -34,6 +36,7 @@ class BindingData : public SnapshotableObject {
   AliasedFloat64Array heap_statistics_buffer;
   AliasedFloat64Array heap_space_statistics_buffer;
   AliasedFloat64Array heap_code_statistics_buffer;
+  std::unique_ptr<heap_profile_labels::LabelRegistry> heap_profile_labels;
 
   void MemoryInfo(MemoryTracker* tracker) const override;
   SET_SELF_SIZE(BindingData)

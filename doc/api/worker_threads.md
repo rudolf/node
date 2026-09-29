@@ -1999,6 +1999,10 @@ added:
 Starting a Heap profile then return a Promise that fulfills with an error
 or an `HeapProfileHandle` object. This API supports `await using` syntax.
 
+The `labels` option of [`v8.startHeapProfile()`][] is not supported here and
+throws `ERR_INVALID_ARG_VALUE`. To use [heap profile labels][] in a worker,
+call `v8.startHeapProfile({ labels: true })` in the worker itself.
+
 ```cjs
 const { Worker } = require('node:worker_threads');
 
@@ -2275,6 +2279,7 @@ thread spawned will spawn another until the application crashes.
 [`trace_events`]: tracing.md
 [`v8.getHeapSnapshot()`]: v8.md#v8getheapsnapshotoptions
 [`v8.getHeapStatistics()`]: v8.md#v8getheapstatistics
+[`v8.startHeapProfile()`]: v8.md#v8startheapprofileoptions
 [`vm`]: vm.md
 [`worker.SHARE_ENV`]: #worker_threadsshare_env
 [`worker.on('message')`]: #event-message_1
@@ -2286,5 +2291,6 @@ thread spawned will spawn another until the application crashes.
 [browser `LockManager`]: https://developer.mozilla.org/en-US/docs/Web/API/LockManager
 [browser `MessagePort`]: https://developer.mozilla.org/en-US/docs/Web/API/MessagePort
 [contextified]: vm.md#what-does-it-mean-to-contextify-an-object
+[heap profile labels]: v8.md#heap-profile-labels
 [locks.request()]: #locksrequestname-options-callback
 [v8.serdes]: v8.md#serialization-api
