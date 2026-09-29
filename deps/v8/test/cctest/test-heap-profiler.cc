@@ -4518,6 +4518,211 @@ TEST(SamplingHeapProfilerSampleIsLive) {
   heap_profiler->StopSamplingHeapProfiler();
 }
 
+namespace {
+
+uintptr_t sample_context_calls = 0;
+
+void* CountingSampleContextExtractor(v8::Isolate*) {
+  return reinterpret_cast<void*>(++sample_context_calls << 1);
+}
+
+}  // namespace
+
+TEST(SamplingHeapProfilerSampleContext) {
+  v8::HandleScope scope(CcTest::isolate());
+  LocalContext env;
+  v8::HeapProfiler* heap_profiler = env.isolate()->GetHeapProfiler();
+
+  // Suppress randomness to avoid flakiness in tests.
+  i::v8_flags.sampling_heap_profiler_suppress_randomness = true;
+
+  sample_context_calls = 0;
+  heap_profiler->StartSamplingHeapProfiler(
+      64, 16,
+      static_cast<v8::HeapProfiler::SamplingFlags>(
+          v8::HeapProfiler::kSamplingForceGC |
+          v8::HeapProfiler::kSamplingIncludeObjectsCollectedByMajorGC),
+      CountingSampleContextExtractor);
+
+  CompileRun(
+      "var retained = [];\n"
+      "for (var i = 0; i < 500; i++) retained.push(new Array(10));\n"
+      "for (var i = 0; i < 500; i++) new Array(10);\n");
+
+  std::unique_ptr<v8::AllocationProfile> profile(
+      heap_profiler->GetAllocationProfile());
+  CHECK(profile);
+  const auto& samples = profile->GetSamples();
+  CHECK(!samples.empty());
+
+  int dead_samples = 0;
+  for (size_t i = 0; i < samples.size(); ++i) {
+    // Sample ids and extractor calls both count from 1.
+    CHECK_EQ(reinterpret_cast<void*>(samples[i].sample_id << 1),
+             profile->GetSampleContext(i));
+    if (!samples[i].is_live) ++dead_samples;
+  }
+  CHECK_GT(dead_samples, 0);
+  CHECK_GE(sample_context_calls, samples.size());
+  CHECK_NULL(profile->GetSampleContext(samples.size()));
+
+  heap_profiler->StopSamplingHeapProfiler();
+}
+
+TEST(SamplingHeapProfilerNoSampleContextExtractor) {
+  v8::HandleScope scope(CcTest::isolate());
+  LocalContext env;
+  v8::HeapProfiler* heap_profiler = env.isolate()->GetHeapProfiler();
+
+  // Suppress randomness to avoid flakiness in tests.
+  i::v8_flags.sampling_heap_profiler_suppress_randomness = true;
+
+  heap_profiler->StartSamplingHeapProfiler(64);
+  CompileRun(
+      "var retained = [];\n"
+      "for (var i = 0; i < 100; i++) retained.push(new Array(10));\n");
+
+  std::unique_ptr<v8::AllocationProfile> profile(
+      heap_profiler->GetAllocationProfile());
+  CHECK(profile);
+  CHECK(!profile->GetSamples().empty());
+  for (size_t i = 0; i < profile->GetSamples().size(); ++i) {
+    CHECK_NULL(profile->GetSampleContext(i));
+  }
+
+  heap_profiler->StopSamplingHeapProfiler();
+}
+
+#ifdef V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
+namespace {
+
+v8::Local<v8::Object> NewHolder(v8::Local<v8::Context> context, void* ptr) {
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
+  v8::Local<v8::ObjectTemplate> templ = v8::ObjectTemplate::New(isolate);
+  templ->SetInternalFieldCount(1);
+  v8::Local<v8::Object> holder = templ->NewInstance(context).ToLocalChecked();
+  holder->SetAlignedPointerInInternalField(0, ptr,
+                                           v8::kEmbedderDataTypeTagDefault);
+  return holder;
+}
+
+void* LookupCped(v8::Isolate* isolate, const v8::Global<v8::Value>& key) {
+  return v8::GetAlignedPointerFromContinuationPreservedEmbedderDataMap(isolate,
+                                                                       key);
+}
+
+}  // namespace
+
+TEST(GetAlignedPointerFromContinuationPreservedEmbedderDataMap) {
+  LocalContext env;
+  v8::Isolate* isolate = env.isolate();
+  v8::HandleScope scope(isolate);
+  v8::Local<v8::Context> context = env.local();
+  int target;
+
+  v8::Local<v8::Object> key = v8::Object::New(isolate);
+  v8::Global<v8::Value> global_key(isolate, key);
+  v8::Local<v8::Map> map = v8::Map::New(isolate);
+  map->Set(context, v8::Object::New(isolate), NewHolder(context, &target))
+      .ToLocalChecked();
+
+  CHECK_NULL(LookupCped(isolate, v8::Global<v8::Value>()));
+  isolate->SetContinuationPreservedEmbedderDataV2(v8::Object::New(isolate));
+  CHECK_NULL(LookupCped(isolate, global_key));
+
+  isolate->SetContinuationPreservedEmbedderDataV2(map);
+  // The key has no identity hash yet.
+  CHECK_NULL(LookupCped(isolate, global_key));
+  key->GetIdentityHash();
+  CHECK_NULL(LookupCped(isolate, global_key));
+
+  map->Set(context, key, NewHolder(context, &target)).ToLocalChecked();
+  CHECK_EQ(&target, LookupCped(isolate, global_key));
+
+  map->Set(context, key, v8::Object::New(isolate)).ToLocalChecked();
+  CHECK_NULL(LookupCped(isolate, global_key));
+  map->Set(context, key, v8::Number::New(isolate, 1)).ToLocalChecked();
+  CHECK_NULL(LookupCped(isolate, global_key));
+
+  isolate->SetContinuationPreservedEmbedderDataV2(v8::Local<v8::Data>());
+}
+
+namespace {
+
+v8::Global<v8::Value>* cped_key = nullptr;
+void* cped_target = nullptr;
+int cped_hits = 0;
+int cped_misses = 0;
+int cped_unexpected = 0;
+
+void* CpedMapSampleContextExtractor(v8::Isolate* isolate) {
+  void* result = LookupCped(isolate, *cped_key);
+  if (result == cped_target) {
+    ++cped_hits;
+  } else if (result == nullptr) {
+    ++cped_misses;
+  } else {
+    ++cped_unexpected;
+  }
+  return result;
+}
+
+void SetCped(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  info.GetIsolate()->SetContinuationPreservedEmbedderDataV2(info[0]);
+}
+
+}  // namespace
+
+TEST(SamplingHeapProfilerCpedMapExtractor) {
+  LocalContext env;
+  v8::Isolate* isolate = env.isolate();
+  v8::HandleScope scope(isolate);
+  v8::Local<v8::Context> context = env.local();
+  v8::HeapProfiler* heap_profiler = isolate->GetHeapProfiler();
+  int target;
+
+  v8::Local<v8::Object> key = v8::Object::New(isolate);
+  v8::Global<v8::Value> global_key(isolate, key);
+  cped_key = &global_key;
+  cped_target = &target;
+  cped_hits = cped_misses = cped_unexpected = 0;
+  v8::Local<v8::Object> global = context->Global();
+  CHECK(global->Set(context, v8_str("key"), key).FromJust());
+  CHECK(global->Set(context, v8_str("holder"), NewHolder(context, &target))
+            .FromJust());
+  CHECK(global
+            ->Set(context, v8_str("setCped"),
+                  v8::Function::New(context, SetCped).ToLocalChecked())
+            .FromJust());
+
+  // Suppress randomness to avoid flakiness in tests.
+  i::v8_flags.sampling_heap_profiler_suppress_randomness = true;
+  heap_profiler->StartSamplingHeapProfiler(64, 16,
+                                           v8::HeapProfiler::kSamplingNoFlags,
+                                           CpedMapSampleContextExtractor);
+
+  // Each frame is a new Map, and it grows while it is the current CPED.
+  CompileRun(
+      "for (var i = 0; i < 200; i++) {\n"
+      "  var frame = new Map();\n"
+      "  setCped(frame);\n"
+      "  frame.set(key, holder);\n"
+      "  for (var j = 0; j < 20; j++) frame.set({}, j);\n"
+      "  for (var j = 0; j < 20; j++) new Array(10);\n"
+      "  setCped(undefined);\n"
+      "  for (var j = 0; j < 20; j++) new Array(10);\n"
+      "}\n");
+
+  heap_profiler->StopSamplingHeapProfiler();
+  isolate->SetContinuationPreservedEmbedderDataV2(v8::Local<v8::Data>());
+  cped_key = nullptr;
+
+  CHECK_GT(cped_hits, 0);
+  CHECK_GT(cped_misses, 0);
+  CHECK_EQ(0, cped_unexpected);
+}
+#endif  // V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
+
 TEST(HeapSnapshotPrototypeNotJSReceiver) {
   LocalContext env;
   v8::HandleScope scope(env.isolate());

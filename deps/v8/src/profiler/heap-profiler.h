@@ -73,8 +73,10 @@ class HeapProfiler : public HeapObjectAllocationTracker {
   V8_EXPORT_PRIVATE std::string TakeSnapshotToString(
       const v8::HeapProfiler::HeapSnapshotOptions options);
 
-  bool StartSamplingHeapProfiler(uint64_t sample_interval, int stack_depth,
-                                 v8::HeapProfiler::SamplingFlags);
+  bool StartSamplingHeapProfiler(
+      uint64_t sample_interval, int stack_depth,
+      v8::HeapProfiler::SamplingFlags,
+      v8::SampleContextExtractor sample_context_extractor = nullptr);
   void StopSamplingHeapProfiler();
   bool is_sampling_allocations() { return !!sampling_heap_profiler_; }
   AllocationProfile* GetAllocationProfile();

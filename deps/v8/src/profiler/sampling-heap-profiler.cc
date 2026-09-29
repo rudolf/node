@@ -53,7 +53,8 @@ v8::AllocationProfile::Allocation SamplingHeapProfiler::ScaleSample(
 
 SamplingHeapProfiler::SamplingHeapProfiler(
     Heap* heap, StringsStorage* names, uint64_t rate, int stack_depth,
-    v8::HeapProfiler::SamplingFlags flags)
+    v8::HeapProfiler::SamplingFlags flags,
+    v8::SampleContextExtractor sample_context_extractor)
     : isolate_(Isolate::FromHeap(heap)),
       heap_(heap),
       allocation_observer_(heap_, static_cast<intptr_t>(rate), rate, this,
@@ -63,7 +64,8 @@ SamplingHeapProfiler::SamplingHeapProfiler(
                     next_node_id()),
       stack_depth_(stack_depth),
       rate_(rate),
-      flags_(flags) {
+      flags_(flags),
+      sample_context_extractor_(sample_context_extractor) {
   CHECK_GT(rate_, 0u);
   heap_->AddAllocationObserversToAllSpaces(&allocation_observer_,
                                            &allocation_observer_);
@@ -93,10 +95,18 @@ void SamplingHeapProfiler::SampleObject(Address soon_object, size_t size) {
           TrustedHeapLayout::InTrustedSpace(heap_object) || !IsTheHole(*obj)));
   auto loc = Local<v8::Value>::FromSlot(obj.location());
 
+  void* context = nullptr;
+  if (sample_context_extractor_ != nullptr) {
+    DisallowJavascriptExecutionDebugOnly no_js(isolate_);
+    DisallowHeapAllocation no_allocation;
+    context =
+        sample_context_extractor_(reinterpret_cast<v8::Isolate*>(isolate_));
+  }
+
   AllocationNode* node = AddStack();
   node->allocations_[size]++;
-  auto sample =
-      std::make_unique<Sample>(size, node, loc, this, next_sample_id());
+  auto sample = std::make_unique<Sample>(size, node, loc, this,
+                                         next_sample_id(), context);
   sample->global.SetWeak(sample.get(), OnWeakCallback,
                          WeakCallbackType::kParameter);
   samples_.emplace(sample.get(), std::move(sample));
@@ -301,23 +311,27 @@ v8::AllocationProfile* SamplingHeapProfiler::GetAllocationProfile() {
   }
   auto profile = new v8::internal::AllocationProfile();
   TranslateAllocationNode(profile, &profile_root_, scripts);
-  profile->samples_ = BuildSamples();
+  BuildSamples(profile);
 
   return profile;
 }
 
-const std::vector<v8::AllocationProfile::Sample>
-SamplingHeapProfiler::BuildSamples() const {
-  std::vector<v8::AllocationProfile::Sample> samples;
+void SamplingHeapProfiler::BuildSamples(AllocationProfile* profile) const {
+  std::vector<v8::AllocationProfile::Sample>& samples = profile->samples_;
   samples.reserve(samples_.size());
+  if (sample_context_extractor_ != nullptr) {
+    profile->sample_contexts_.reserve(samples_.size());
+  }
   for (const auto& it : samples_) {
     const Sample* sample = it.second.get();
     const bool is_live = !sample->global.IsEmpty();
     samples.emplace_back(v8::AllocationProfile::Sample{
         sample->owner->id_, sample->size, ScaleSample(sample->size, 1).count,
         sample->sample_id, is_live});
+    if (sample_context_extractor_ != nullptr) {
+      profile->sample_contexts_.push_back(sample->context);
+    }
   }
-  return samples;
 }
 
 }  // namespace internal

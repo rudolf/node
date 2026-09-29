@@ -36,9 +36,15 @@ class AllocationProfile : public v8::AllocationProfile {
     return samples_;
   }
 
+  void* GetSampleContext(size_t index) const override {
+    return index < sample_contexts_.size() ? sample_contexts_[index] : nullptr;
+  }
+
  private:
   std::deque<v8::AllocationProfile::Node> nodes_;
   std::vector<v8::AllocationProfile::Sample> samples_;
+  // Parallel to samples_. Empty if no sample context extractor was installed.
+  std::vector<void*> sample_contexts_;
 
   friend class SamplingHeapProfiler;
 };
@@ -101,12 +107,13 @@ class SamplingHeapProfiler {
 
   struct Sample {
     Sample(size_t size_, AllocationNode* owner_, Local<Value> local_,
-           SamplingHeapProfiler* profiler_, uint64_t sample_id)
+           SamplingHeapProfiler* profiler_, uint64_t sample_id, void* context_)
         : size(size_),
           owner(owner_),
           global(reinterpret_cast<v8::Isolate*>(profiler_->isolate_), local_),
           profiler(profiler_),
-          sample_id(sample_id) {}
+          sample_id(sample_id),
+          context(context_) {}
     Sample(const Sample&) = delete;
     Sample& operator=(const Sample&) = delete;
     const size_t size;
@@ -114,10 +121,12 @@ class SamplingHeapProfiler {
     Global<Value> global;
     SamplingHeapProfiler* const profiler;
     const uint64_t sample_id;
+    void* const context;
   };
 
   SamplingHeapProfiler(Heap* heap, StringsStorage* names, uint64_t rate,
-                       int stack_depth, v8::HeapProfiler::SamplingFlags flags);
+                       int stack_depth, v8::HeapProfiler::SamplingFlags flags,
+                       v8::SampleContextExtractor sample_context_extractor);
   ~SamplingHeapProfiler();
   SamplingHeapProfiler(const SamplingHeapProfiler&) = delete;
   SamplingHeapProfiler& operator=(const SamplingHeapProfiler&) = delete;
@@ -160,7 +169,7 @@ class SamplingHeapProfiler {
 
   void SampleObject(Address soon_object, size_t size);
 
-  const std::vector<v8::AllocationProfile::Sample> BuildSamples() const;
+  void BuildSamples(AllocationProfile* profile) const;
 
   AllocationNode* FindOrAddChildNode(AllocationNode* parent, const char* name,
                                      int script_id, int start_position);
@@ -194,6 +203,7 @@ class SamplingHeapProfiler {
   const int stack_depth_;
   const uint64_t rate_;
   v8::HeapProfiler::SamplingFlags flags_;
+  const v8::SampleContextExtractor sample_context_extractor_;
 };
 
 }  // namespace internal
