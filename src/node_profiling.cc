@@ -73,7 +73,8 @@ bool SerializeHeapProfile(Isolate* isolate, std::ostringstream& out_stream) {
 HeapProfileOptions ParseHeapProfileOptions(
     const v8::FunctionCallbackInfo<Value>& args) {
   HeapProfileOptions options;
-  CHECK_LE(args.Length(), 3);
+  // v8.startHeapProfile() passes its remaining options after these.
+  CHECK_LE(args.Length(), 4);
   if (args.Length() > 0) {
     CHECK(args[0]->IsNumber());
     options.sample_interval =

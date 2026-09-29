@@ -28,6 +28,7 @@
 #include "node.h"
 #include "node_binding.h"
 #include "node_file_utils.h"
+#include "node_heap_profile_labels.h"
 #include "node_mutex.h"
 #include "tracing/trace_event.h"
 #include "util.h"
@@ -139,9 +140,13 @@ class NodeArrayBufferAllocator : public ArrayBufferAllocator {
   inline uint64_t total_mem_usage() const {
     return total_mem_usage_.load(std::memory_order_relaxed);
   }
+  heap_profile_labels::ExternalMemoryTracker* heap_profile_tracker() {
+    return &heap_profile_tracker_;
+  }
 
  private:
   std::atomic<size_t> total_mem_usage_ {0};
+  heap_profile_labels::ExternalMemoryTracker heap_profile_tracker_;
 
   // Delegate to V8's allocator for compatibility with the V8 memory cage.
   std::unique_ptr<v8::ArrayBuffer::Allocator> allocator_{

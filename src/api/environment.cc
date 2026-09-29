@@ -118,6 +118,9 @@ void* NodeArrayBufferAllocator::Allocate(size_t size) {
   ret = allocator_->Allocate(size);
   if (ret != nullptr) [[likely]] {
     total_mem_usage_.fetch_add(size, std::memory_order_relaxed);
+    if (heap_profile_tracker_.active()) [[unlikely]] {
+      heap_profile_tracker_.TrackAllocate(ret, size);
+    }
   }
   return ret;
 }
@@ -127,11 +130,17 @@ void* NodeArrayBufferAllocator::AllocateUninitialized(size_t size) {
   void* ret = allocator_->AllocateUninitialized(size);
   if (ret != nullptr) [[likely]] {
     total_mem_usage_.fetch_add(size, std::memory_order_relaxed);
+    if (heap_profile_tracker_.active()) [[unlikely]] {
+      heap_profile_tracker_.TrackAllocate(ret, size);
+    }
   }
   return ret;
 }
 
 void NodeArrayBufferAllocator::Free(void* data, size_t size) {
+  if (heap_profile_tracker_.active()) [[unlikely]] {
+    heap_profile_tracker_.TrackFree(data);
+  }
   total_mem_usage_.fetch_sub(size, std::memory_order_relaxed);
   allocator_->Free(data, size);
 }
