@@ -64,6 +64,21 @@ using ProfilerId = uint32_t;
  */
 using SampleContextExtractor = void* (*)(Isolate*);
 
+/**
+ * Returns the aligned pointer in embedder field 0 of the value stored for
+ * |key| in the isolate's current continuation preserved embedder data, if
+ * that data is a Map. Returns nullptr if it is not a Map, the key is absent,
+ * the value has no embedder field, the heap is in garbage collection, or V8
+ * was built without continuation preserved embedder data.
+ *
+ * This function does not allocate, lock or run JavaScript, so it can be
+ * called from a sampling heap profiler SampleContextExtractor. |key| must
+ * already have an identity hash, for example because it was used as a Map
+ * key before. It must be called on the isolate's thread.
+ */
+V8_EXPORT void* GetAlignedPointerFromContinuationPreservedEmbedderDataMap(
+    Isolate* isolate, const Global<Value>& key);
+
 struct CpuProfileDeoptFrame {
   int script_id;
   size_t position;
@@ -899,6 +914,15 @@ class V8_EXPORT AllocationProfile {
   virtual Node* GetRootNode() = 0;
   virtual const std::vector<Sample>& GetSamples() = 0;
 
+  /**
+   * Returns the embedder-supplied sample context for GetSamples()[index]. The
+   * pointer was produced by the SampleContextExtractor passed to
+   * HeapProfiler::StartSamplingHeapProfiler. Returns nullptr if no extractor
+   * was installed, the extractor returned nullptr for this sample, or the
+   * index is out of range.
+   */
+  virtual void* GetSampleContext(size_t index) const { return nullptr; }
+
   virtual ~AllocationProfile() = default;
 
   static const int kNoLineNumberInfo = Message::kNoLineNumberInfo;
@@ -1307,11 +1331,21 @@ class V8_EXPORT HeapProfiler {
    * Objects allocated before the sampling is started will not be included in
    * the profile.
    *
+   * If |sample_context_extractor| is set, it is called once for each sampled
+   * allocation and its result is retrievable via
+   * AllocationProfile::GetSampleContext. Unlike a CPU profiler extractor, it
+   * runs on the isolate's thread while the allocation is being sampled, with
+   * garbage collection disallowed. It may create local handles in the current
+   * HandleScope, but it MUST NOT run JavaScript, allocate on the V8 heap, or
+   * start or stop the sampling heap profiler. It does not need to be
+   * async-signal-safe. The returned pointer is not dereferenced by V8.
+   *
    * Returns false if a sampling heap profiler is already running.
    */
-  bool StartSamplingHeapProfiler(uint64_t sample_interval = 512 * 1024,
-                                 int stack_depth = 16,
-                                 SamplingFlags flags = kSamplingNoFlags);
+  bool StartSamplingHeapProfiler(
+      uint64_t sample_interval = 512 * 1024, int stack_depth = 16,
+      SamplingFlags flags = kSamplingNoFlags,
+      SampleContextExtractor sample_context_extractor = nullptr);
 
   /**
    * Stops the sampling heap profile and discards the current profile.

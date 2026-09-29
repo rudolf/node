@@ -10362,6 +10362,41 @@ void Isolate::SetContinuationPreservedEmbedderDataV2(Local<Data> data) {
 #endif  // V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
 }
 
+void* GetAlignedPointerFromContinuationPreservedEmbedderDataMap(
+    Isolate* isolate, const Global<Value>& key) {
+#ifdef V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
+  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
+  if (key.IsEmpty() || i_isolate->heap()->gc_state() != i::Heap::NOT_IN_GC) {
+    return nullptr;
+  }
+  i::DisallowGarbageCollection no_gc;
+  i::Tagged<i::Object> data =
+      i_isolate->isolate_data()->continuation_preserved_embedder_data();
+  if (!IsJSMap(data)) return nullptr;
+  i::Tagged<i::Object> table_obj = i::Cast<i::JSMap>(data)->table();
+  if (!IsOrderedHashMap(table_obj)) return nullptr;
+  i::Tagged<i::OrderedHashMap> table = i::Cast<i::OrderedHashMap>(table_obj);
+  // An obsolete table stores its successor where FindEntry expects a Smi.
+  if (table->IsObsolete()) return nullptr;
+  i::InternalIndex entry =
+      table->FindEntry(i_isolate, *Utils::OpenPersistent(key));
+  if (entry.is_not_found()) return nullptr;
+  i::Tagged<i::Object> value = table->ValueAt(entry);
+  if (!IsJSObject(value)) return nullptr;
+  i::Tagged<i::JSObject> holder = i::Cast<i::JSObject>(value);
+  if (holder->GetEmbedderFieldCount() < 1) return nullptr;
+  void* result;
+  if (!i::EmbedderDataSlot(holder, 0).ToAlignedPointer(
+          i_isolate, &result,
+          {i::kFirstEmbedderDataTag, i::kLastEmbedderDataTag})) {
+    return nullptr;
+  }
+  return result;
+#else   // V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
+  return nullptr;
+#endif  // V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
+}
+
 void Isolate::GetHeapStatistics(HeapStatistics* heap_statistics) {
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(this);
   i::Heap* heap = i_isolate->heap();
@@ -11973,11 +12008,11 @@ SnapshotObjectId HeapProfiler::GetHeapStats(OutputStream* stream,
   return heap_profiler->PushHeapObjectsStats(stream, timestamp_us);
 }
 
-bool HeapProfiler::StartSamplingHeapProfiler(uint64_t sample_interval,
-                                             int stack_depth,
-                                             SamplingFlags flags) {
+bool HeapProfiler::StartSamplingHeapProfiler(
+    uint64_t sample_interval, int stack_depth, SamplingFlags flags,
+    SampleContextExtractor sample_context_extractor) {
   return reinterpret_cast<i::HeapProfiler*>(this)->StartSamplingHeapProfiler(
-      sample_interval, stack_depth, flags);
+      sample_interval, stack_depth, flags, sample_context_extractor);
 }
 
 void HeapProfiler::StopSamplingHeapProfiler() {
