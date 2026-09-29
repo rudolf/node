@@ -5,11 +5,18 @@
 #include "util-inl.h"
 #include "v8-profiler.h"
 
+#include <algorithm>
+#include <cmath>
+#include <string_view>
+
 namespace node {
 namespace heap_profile_labels {
 
 using v8::Array;
+using v8::BigInt;
+using v8::Boolean;
 using v8::Context;
+using v8::DictionaryTemplate;
 using v8::EscapableHandleScope;
 using v8::HandleScope;
 using v8::IntegrityLevel;
@@ -44,24 +51,24 @@ std::unordered_map<Isolate*, std::unique_ptr<HeapProfileSession>>& Sessions() {
 
 std::atomic<uint32_t> next_session_id{0};
 
+constexpr size_t kMaxGroupValueLength = 255;
+
 MaybeLocal<String> NewString(Isolate* isolate, const std::string& value) {
   return String::NewFromUtf8(
       isolate, value.data(), NewStringType::kNormal, value.size());
 }
 
 MaybeLocal<Object> NewLabelsObject(Local<Context> context,
-                                   const LabelSet* set) {
+                                   const LabelSet::Labels& labels) {
   Isolate* isolate = Isolate::GetCurrent();
   Local<Object> object = Object::New(isolate);
-  if (set != nullptr) {
-    for (const auto& [name, value] : set->labels()) {
-      Local<String> js_name;
-      Local<String> js_value;
-      if (!NewString(isolate, name).ToLocal(&js_name) ||
-          !NewString(isolate, value).ToLocal(&js_value) ||
-          object->CreateDataProperty(context, js_name, js_value).IsNothing()) {
-        return {};
-      }
+  for (const auto& [name, value] : labels) {
+    Local<String> js_name;
+    Local<String> js_value;
+    if (!NewString(isolate, name).ToLocal(&js_name) ||
+        !NewString(isolate, value).ToLocal(&js_value) ||
+        object->CreateDataProperty(context, js_name, js_value).IsNothing()) {
+      return {};
     }
   }
   if (object->SetIntegrityLevel(context, IntegrityLevel::kFrozen).IsNothing()) {
@@ -160,6 +167,7 @@ void ExternalMemoryTracker::Disable() {
   session_ = nullptr;
   Mutex::ScopedLock lock(mutex_);
   entries_.clear();
+  stats_.clear();
 }
 
 void ExternalMemoryTracker::TrackAllocate(void* data, size_t size) {
@@ -170,15 +178,32 @@ void ExternalMemoryTracker::TrackAllocate(void* data, size_t size) {
       Isolate::TryGetCurrent() != isolate) {
     return;
   }
-  LabelSet* set = session_->CaptureCurrent();
-  if (set == nullptr) return;
+  auto [set, group] = session_->CaptureCurrent();
+  const bool groups = session_->groups();
+  if (set == nullptr && !groups) return;
   Mutex::ScopedLock lock(mutex_);
-  entries_[data] = {set, size};
+  entries_[data] = {set, size, group};
+  if (!groups) return;
+  if (group >= stats_.size()) stats_.resize(group + 1);
+  GroupStats& stats = stats_[group];
+  stats.allocated_bytes += size;
+  stats.allocated_count++;
+  stats.current_bytes += size;
+  stats.window_peak_bytes =
+      std::max(stats.window_peak_bytes, stats.current_bytes);
 }
 
 void ExternalMemoryTracker::TrackFree(void* data) {
   Mutex::ScopedLock lock(mutex_);
-  entries_.erase(data);
+  auto it = entries_.find(data);
+  if (it == entries_.end()) return;
+  if (it->second.group < stats_.size()) {
+    GroupStats& stats = stats_[it->second.group];
+    stats.freed_bytes += it->second.size;
+    stats.freed_count++;
+    stats.current_bytes -= it->second.size;
+  }
+  entries_.erase(it);
 }
 
 std::unordered_map<LabelSet*, uint64_t> ExternalMemoryTracker::LiveBytes()
@@ -186,19 +211,36 @@ std::unordered_map<LabelSet*, uint64_t> ExternalMemoryTracker::LiveBytes()
   std::unordered_map<LabelSet*, uint64_t> result;
   Mutex::ScopedLock lock(mutex_);
   for (const auto& entry : entries_) {
+    if (entry.second.set == nullptr) continue;
     result[entry.second.set] += entry.second.size;
   }
   return result;
 }
 
+std::vector<ExternalMemoryTracker::GroupStats> ExternalMemoryTracker::Stats(
+    bool advance_peak_window) {
+  Mutex::ScopedLock lock(mutex_);
+  if (advance_peak_window) {
+    for (GroupStats& stats : stats_) {
+      stats.published_peak_bytes = stats.window_peak_bytes;
+      stats.window_peak_bytes = stats.current_bytes;
+    }
+  }
+  return stats_;
+}
+
 HeapProfileSession::HeapProfileSession(Isolate* isolate,
                                        const void* owner,
-                                       LabelRegistry* registry,
-                                       NodeArrayBufferAllocator* allocator)
+                                       NodeArrayBufferAllocator* allocator,
+                                       Options options)
     : isolate_(isolate),
       owner_(owner),
       id_(++next_session_id),
-      registry_(registry) {
+      sample_interval_(options.sample_interval),
+      registry_(options.registry),
+      group_by_(std::move(options.group_by)),
+      max_groups_(options.max_groups) {
+  if (groups()) groups_.resize(kOverflowGroup + 1);
   if (registry_ != nullptr && allocator != nullptr &&
       allocator->heap_profile_tracker()->Enable(isolate, this)) {
     tracker_ = allocator->heap_profile_tracker();
@@ -213,12 +255,12 @@ HeapProfileSession::~HeapProfileSession() {
 HeapProfileSession* HeapProfileSession::Start(
     Isolate* isolate,
     const void* owner,
-    LabelRegistry* registry,
-    NodeArrayBufferAllocator* allocator) {
+    NodeArrayBufferAllocator* allocator,
+    Options options) {
   // The previous session must release the external tracker first.
   Destroy(isolate);
   auto session = std::unique_ptr<HeapProfileSession>(
-      new HeapProfileSession(isolate, owner, registry, allocator));
+      new HeapProfileSession(isolate, owner, allocator, std::move(options)));
   HeapProfileSession* result = session.get();
   Mutex::ScopedLock lock(SessionsMutex());
   Sessions()[isolate] = std::move(session);
@@ -248,22 +290,58 @@ bool HeapProfileSession::Destroy(Isolate* isolate, const void* owner) {
 
 void* HeapProfileSession::ExtractSampleContext(Isolate* isolate) {
   HeapProfileSession* session = Get(isolate);
-  return session != nullptr ? session->CaptureCurrent() : nullptr;
+  if (session == nullptr) return nullptr;
+  Capture capture = session->CaptureCurrent();
+  if (session->groups()) session->groups_[capture.group].allocated_samples++;
+  return capture.set;
 }
 
-LabelSet* HeapProfileSession::CaptureCurrent() {
-  if (registry_ == nullptr) return nullptr;
+HeapProfileSession::Capture HeapProfileSession::CaptureCurrent() {
+  if (registry_ == nullptr) return {nullptr, kUnknownGroup};
   void* context = v8::GetAlignedPointerFromContinuationPreservedEmbedderDataMap(
       isolate_, registry_->als_key());
-  if (context == nullptr) return nullptr;
+  if (context == nullptr) return {nullptr, kUnknownGroup};
   LabelSet* set = static_cast<LabelSet*>(context);
-  auto [it, inserted] = captured_.try_emplace(set, reads_);
+  auto [it, inserted] = captured_.try_emplace(set, Captured{reads_, 0});
   if (inserted) {
     set->Ref();
+    it->second.group = groups() ? ResolveGroup(set) : kUnknownGroup;
   } else {
-    it->second = reads_;
+    it->second.read = reads_;
   }
-  return set;
+  return {set, it->second.group};
+}
+
+uint32_t HeapProfileSession::ResolveGroup(const LabelSet* set) {
+  std::string key;
+  LabelSet::Labels labels;
+  for (size_t i = 0; i < group_by_.size(); i++) {
+    const std::string& name = group_by_[i];
+    auto it = std::find_if(
+        set->labels().begin(), set->labels().end(), [&](const auto& label) {
+          return label.first == name;
+        });
+    if (it == set->labels().end() || it->second.empty()) continue;
+    const std::string& value = it->second;
+    if (value.size() > kMaxGroupValueLength) {
+      overflow_count_++;
+      return kOverflowGroup;
+    }
+    key += std::to_string(i) + ':' + std::to_string(value.size()) + ':';
+    key += value;
+    labels.emplace_back(name, value);
+  }
+  if (labels.empty()) return kUnknownGroup;
+  auto it = group_index_.find(key);
+  if (it != group_index_.end()) return it->second;
+  if (groups_.size() - (kOverflowGroup + 1) >= max_groups_) {
+    overflow_count_++;
+    return kOverflowGroup;
+  }
+  const uint32_t group = groups_.size();
+  groups_.push_back({std::move(labels)});
+  group_index_.emplace(std::move(key), group);
+  return group;
 }
 
 MaybeLocal<Value> HeapProfileSession::GetAllocationProfile(
@@ -277,11 +355,15 @@ MaybeLocal<Value> HeapProfileSession::GetAllocationProfile(
 
   std::unordered_set<LabelSet*> referenced;
   std::unordered_map<LabelSet*, Local<Object>> labels_objects;
+  const LabelSet::Labels no_labels;
   auto labels_object = [&](LabelSet* set) -> MaybeLocal<Object> {
     auto it = labels_objects.find(set);
     if (it != labels_objects.end()) return it->second;
     Local<Object> object;
-    if (!NewLabelsObject(context, set).ToLocal(&object)) return {};
+    if (!NewLabelsObject(context, set != nullptr ? set->labels() : no_labels)
+             .ToLocal(&object)) {
+      return {};
+    }
     labels_objects.emplace(set, object);
     return object;
   };
@@ -381,10 +463,129 @@ MaybeLocal<Value> HeapProfileSession::GetAllocationProfile(
   return scope.Escape(result);
 }
 
+MaybeLocal<Value> HeapProfileSession::GetHeapStats(Local<Context> context,
+                                                   bool advance_peak_window) {
+  Isolate* isolate = isolate_;
+  EscapableHandleScope scope(isolate);
+  if (!groups()) return scope.Escape(Undefined(isolate));
+  const uint64_t read = ++reads_;
+  std::unique_ptr<v8::AllocationProfile> profile(
+      isolate->GetHeapProfiler()->GetAllocationProfile());
+  if (!profile) return scope.Escape(Undefined(isolate));
+
+  struct HeapStats {
+    uint64_t samples = 0;
+    double bytes = 0;
+  };
+  std::vector<HeapStats> heap(groups_.size());
+  std::unordered_set<LabelSet*> referenced;
+  const auto& samples = profile->GetSamples();
+  for (size_t i = 0; i < samples.size(); i++) {
+    const v8::AllocationProfile::Sample& sample = samples[i];
+    LabelSet* set = static_cast<LabelSet*>(profile->GetSampleContext(i));
+    uint32_t group = kUnknownGroup;
+    if (set != nullptr) {
+      referenced.insert(set);
+      auto it = captured_.find(set);
+      CHECK(it != captured_.end());
+      group = it->second.group;
+    }
+    if (!sample.is_live) continue;
+    // The scaling V8 applies to allocation profile nodes.
+    const double size = static_cast<double>(sample.size);
+    heap[group].samples++;
+    heap[group].bytes +=
+        size / -std::expm1(-size / static_cast<double>(sample_interval_));
+  }
+  profile.reset();
+
+  std::vector<ExternalMemoryTracker::GroupStats> external;
+  if (tracker_ != nullptr) {
+    external = tracker_->Stats(advance_peak_window);
+    for (const auto& entry : tracker_->LiveBytes()) {
+      referenced.insert(entry.first);
+    }
+  }
+  if (advance_peak_window) peak_window_id_++;
+  external.resize(heap.size());
+
+  static constexpr std::string_view group_names[] = {
+      "labels",
+      "isUnknown",
+      "isOverflow",
+      "allocatedHeapSampleCount",
+      "currentHeapSampleCount",
+      "currentHeapBytes",
+      "allocatedExternalBytes",
+      "allocatedExternalCount",
+      "freedExternalBytes",
+      "freedExternalCount",
+      "currentExternalBytes",
+      "publishedPeakExternalBytes",
+  };
+  Local<DictionaryTemplate> group_template =
+      DictionaryTemplate::New(isolate, group_names);
+  auto big = [&](uint64_t value) -> Local<Value> {
+    return BigInt::NewFromUnsigned(isolate, value);
+  };
+  LocalVector<Value> js_groups(isolate);
+  for (uint32_t i = 0; i < heap.size(); i++) {
+    const Group& group = groups_[i];
+    const ExternalMemoryTracker::GroupStats& ext = external[i];
+    if (group.allocated_samples == 0 && heap[i].samples == 0 &&
+        ext.allocated_count == 0) {
+      continue;
+    }
+    Local<Object> labels;
+    if (!NewLabelsObject(context, group.labels).ToLocal(&labels)) return {};
+    MaybeLocal<Value> values[] = {
+        labels,
+        Boolean::New(isolate, i == kUnknownGroup),
+        Boolean::New(isolate, i == kOverflowGroup),
+        big(group.allocated_samples),
+        big(heap[i].samples),
+        big(static_cast<uint64_t>(heap[i].bytes + 0.5)),
+        big(ext.allocated_bytes),
+        big(ext.allocated_count),
+        big(ext.freed_bytes),
+        big(ext.freed_count),
+        big(ext.current_bytes),
+        big(ext.published_peak_bytes),
+    };
+    Local<Object> js_group;
+    if (!NewDictionaryInstance(context, group_template, values)
+             .ToLocal(&js_group)) {
+      return {};
+    }
+    js_groups.push_back(js_group);
+  }
+
+  static constexpr std::string_view names[] = {
+      "sampleInterval",
+      "peakWindowId",
+      "overflowCount",
+      "groups",
+  };
+  MaybeLocal<Value> values[] = {
+      Number::New(isolate, static_cast<double>(sample_interval_)),
+      big(peak_window_id_),
+      big(overflow_count_),
+      Array::New(isolate, js_groups.data(), js_groups.size()),
+  };
+  Local<Object> result;
+  if (!NewDictionaryInstance(
+           context, DictionaryTemplate::New(isolate, names), values)
+           .ToLocal(&result)) {
+    return {};
+  }
+  Compact(read, referenced);
+  return scope.Escape(result);
+}
+
 void HeapProfileSession::Compact(
     uint64_t read, const std::unordered_set<LabelSet*>& referenced) {
   for (auto it = captured_.begin(); it != captured_.end();) {
-    if (it->second >= read || referenced.count(it->first) > 0) {
+    if (it->second.read >= read || referenced.count(it->first) > 0) {
       ++it;
       continue;
     }

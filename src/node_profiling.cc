@@ -74,7 +74,7 @@ HeapProfileOptions ParseHeapProfileOptions(
     const v8::FunctionCallbackInfo<Value>& args) {
   HeapProfileOptions options;
   // v8.startHeapProfile() passes its remaining options after these.
-  CHECK_LE(args.Length(), 4);
+  CHECK_LE(args.Length(), 6);
   if (args.Length() > 0) {
     CHECK(args[0]->IsNumber());
     options.sample_interval =

@@ -307,23 +307,38 @@ void StartHeapProfile(const FunctionCallbackInfo<Value>& args) {
   Isolate* isolate = env->isolate();
   BindingData* binding_data = Realm::GetBindingData<BindingData>(args);
   auto options = ParseHeapProfileOptions(args);
-  LabelRegistry* registry = nullptr;
+  HeapProfileSession::Options session_options{
+      options.sample_interval, nullptr, {}, 0};
   if (args[3]->IsTrue()) {
-    registry = binding_data->heap_profile_labels.get();
-    CHECK_NOT_NULL(registry);
+    session_options.registry = binding_data->heap_profile_labels.get();
+    CHECK_NOT_NULL(session_options.registry);
+  }
+  if (args[4]->IsArray()) {
+    Local<Array> group_by = args[4].As<Array>();
+    for (uint32_t i = 0; i < group_by->Length(); i++) {
+      Local<Value> name;
+      if (!group_by->Get(env->context(), i).ToLocal(&name)) return;
+      session_options.group_by.push_back(Utf8Value(isolate, name).ToString());
+    }
+    CHECK(args[5]->IsUint32());
+    session_options.max_groups = args[5].As<Uint32>()->Value();
   }
 
   if (!isolate->GetHeapProfiler()->StartSamplingHeapProfiler(
           options.sample_interval,
           options.stack_depth,
           options.flags,
-          registry != nullptr ? HeapProfileSession::ExtractSampleContext
-                              : nullptr)) {
+          session_options.registry != nullptr
+              ? HeapProfileSession::ExtractSampleContext
+              : nullptr)) {
     return THROW_ERR_HEAP_PROFILE_HAVE_BEEN_STARTED(
         isolate, "Heap profile has been started");
   }
-  HeapProfileSession* session = HeapProfileSession::Start(
-      isolate, binding_data, registry, env->isolate_data()->node_allocator());
+  HeapProfileSession* session =
+      HeapProfileSession::Start(isolate,
+                                binding_data,
+                                env->isolate_data()->node_allocator(),
+                                std::move(session_options));
   args.GetReturnValue().Set(session->id());
 }
 
@@ -358,6 +373,17 @@ void GetAllocationProfile(const FunctionCallbackInfo<Value>& args) {
           ->GetAllocationProfile(args.GetIsolate()->GetCurrentContext())
           .ToLocal(&profile)) {
     args.GetReturnValue().Set(profile);
+  }
+}
+
+void GetHeapStats(const FunctionCallbackInfo<Value>& args) {
+  if (!IsCurrentHeapProfile(args)) return;
+  Local<Value> stats;
+  if (HeapProfileSession::Get(args.GetIsolate())
+          ->GetHeapStats(args.GetIsolate()->GetCurrentContext(),
+                         args[1]->IsTrue())
+          .ToLocal(&stats)) {
+    args.GetReturnValue().Set(stats);
   }
 }
 
@@ -846,6 +872,7 @@ void Initialize(Local<Object> target,
   SetMethod(context, target, "startHeapProfile", StartHeapProfile);
   SetMethod(context, target, "stopHeapProfile", StopHeapProfile);
   SetMethod(context, target, "getAllocationProfile", GetAllocationProfile);
+  SetMethod(context, target, "getHeapStats", GetHeapStats);
   SetMethod(
       context, target, "setHeapProfileLabelsStore", SetHeapProfileLabelsStore);
   SetMethod(context,
@@ -920,6 +947,7 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(StartHeapProfile);
   registry->Register(StopHeapProfile);
   registry->Register(GetAllocationProfile);
+  registry->Register(GetHeapStats);
   registry->Register(SetHeapProfileLabelsStore);
   registry->Register(PrepareHeapProfileLabelsHolder);
 }
