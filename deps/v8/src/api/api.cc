@@ -11,6 +11,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>  // For move
 #include <vector>
 
@@ -40,6 +41,7 @@
 #include "src/base/logging.h"
 #include "src/base/numerics/safe_conversions.h"
 #include "src/base/platform/memory.h"
+#include "src/base/platform/mutex.h"
 #include "src/base/platform/platform.h"
 #include "src/base/platform/time.h"
 #include "src/base/template-utils.h"
@@ -11596,6 +11598,84 @@ CpuProfiler* CpuProfiler::New(Isolate* v8_isolate,
       reinterpret_cast<i::Isolate*>(v8_isolate), naming_mode, logging_mode));
 }
 
+namespace {
+
+// Extractors are stored outside CpuProfilingOptions so the class layout stays
+// identical to v26.8.1. Entries follow the object across moves and are dropped
+// in the destructor. Lookups happen on the thread that starts profiling, not
+// from the sampling signal handler.
+struct SampleContextExtractorTable {
+  base::Mutex mutex;
+  std::unordered_map<const CpuProfilingOptions*, SampleContextExtractor>
+      entries;
+};
+
+SampleContextExtractorTable& sample_context_extractors() {
+  static SampleContextExtractorTable table;
+  return table;
+}
+
+void RegisterSampleContextExtractor(const CpuProfilingOptions* self,
+                                    SampleContextExtractor extractor) {
+  if (extractor == nullptr) return;
+  SampleContextExtractorTable& table = sample_context_extractors();
+  base::MutexGuard guard(&table.mutex);
+  table.entries[self] = extractor;
+}
+
+void ClearSampleContextExtractor(const CpuProfilingOptions* self) {
+  SampleContextExtractorTable& table = sample_context_extractors();
+  base::MutexGuard guard(&table.mutex);
+  table.entries.erase(self);
+}
+
+void TransferSampleContextExtractor(const CpuProfilingOptions* from,
+                                    const CpuProfilingOptions* to) {
+  if (from == to) return;
+  SampleContextExtractorTable& table = sample_context_extractors();
+  base::MutexGuard guard(&table.mutex);
+  auto it = table.entries.find(from);
+  if (it == table.entries.end()) {
+    table.entries.erase(to);
+    return;
+  }
+  SampleContextExtractor extractor = it->second;
+  table.entries.erase(it);
+  if (extractor == nullptr) {
+    table.entries.erase(to);
+  } else {
+    table.entries[to] = extractor;
+  }
+}
+
+void SetFilterContext(Global<Context>* filter_context,
+                      MaybeLocal<Context> maybe_filter_context) {
+  if (maybe_filter_context.IsEmpty()) return;
+  Local<Context> local_filter_context = maybe_filter_context.ToLocalChecked();
+  filter_context->Reset(v8::Isolate::GetCurrent(), local_filter_context);
+  filter_context->SetWeak();
+}
+
+}  // namespace
+
+// v26.8.1 native addons stack-allocate this class. Do not add members.
+// 32 bytes on 64-bit: three 4-byte fields, 4 bytes of padding, one pointer,
+// one uint8_t, and tail padding. Measured against the v26.8.1 header.
+#if defined(V8_HOST_ARCH_64_BIT)
+static_assert(sizeof(CpuProfilingOptions) == 32,
+              "CpuProfilingOptions must keep the v26.8.1 layout");
+#endif
+
+CpuProfilingOptions::CpuProfilingOptions(
+    CpuProfilingMode mode, unsigned max_samples, int sampling_interval_us,
+    MaybeLocal<Context> filter_context, CpuProfileSource profile_source)
+    : mode_(mode),
+      max_samples_(max_samples),
+      sampling_interval_us_(sampling_interval_us),
+      profile_source_(profile_source) {
+  SetFilterContext(&filter_context_, filter_context);
+}
+
 CpuProfilingOptions::CpuProfilingOptions(
     CpuProfilingMode mode, unsigned max_samples, int sampling_interval_us,
     MaybeLocal<Context> filter_context, CpuProfileSource profile_source,
@@ -11603,13 +11683,41 @@ CpuProfilingOptions::CpuProfilingOptions(
     : mode_(mode),
       max_samples_(max_samples),
       sampling_interval_us_(sampling_interval_us),
-      profile_source_(profile_source),
-      sample_context_extractor_(sample_context_extractor) {
-  if (!filter_context.IsEmpty()) {
-    Local<Context> local_filter_context = filter_context.ToLocalChecked();
-    filter_context_.Reset(v8::Isolate::GetCurrent(), local_filter_context);
-    filter_context_.SetWeak();
-  }
+      profile_source_(profile_source) {
+  SetFilterContext(&filter_context_, filter_context);
+  RegisterSampleContextExtractor(this, sample_context_extractor);
+}
+
+CpuProfilingOptions::CpuProfilingOptions(CpuProfilingOptions&& other)
+    : mode_(other.mode_),
+      max_samples_(other.max_samples_),
+      sampling_interval_us_(other.sampling_interval_us_),
+      filter_context_(std::move(other.filter_context_)),
+      profile_source_(other.profile_source_) {
+  TransferSampleContextExtractor(&other, this);
+}
+
+CpuProfilingOptions& CpuProfilingOptions::operator=(
+    CpuProfilingOptions&& other) {
+  if (this == &other) return *this;
+  mode_ = other.mode_;
+  max_samples_ = other.max_samples_;
+  sampling_interval_us_ = other.sampling_interval_us_;
+  filter_context_ = std::move(other.filter_context_);
+  profile_source_ = other.profile_source_;
+  TransferSampleContextExtractor(&other, this);
+  return *this;
+}
+
+CpuProfilingOptions::~CpuProfilingOptions() {
+  ClearSampleContextExtractor(this);
+}
+
+SampleContextExtractor CpuProfilingOptions::sample_context_extractor() const {
+  SampleContextExtractorTable& table = sample_context_extractors();
+  base::MutexGuard guard(&table.mutex);
+  auto it = table.entries.find(this);
+  return it == table.entries.end() ? nullptr : it->second;
 }
 
 void* CpuProfilingOptions::raw_filter_context() const {
@@ -12006,6 +12114,13 @@ SnapshotObjectId HeapProfiler::GetHeapStats(OutputStream* stream,
                                             int64_t* timestamp_us) {
   i::HeapProfiler* heap_profiler = reinterpret_cast<i::HeapProfiler*>(this);
   return heap_profiler->PushHeapObjectsStats(stream, timestamp_us);
+}
+
+bool HeapProfiler::StartSamplingHeapProfiler(uint64_t sample_interval,
+                                             int stack_depth,
+                                             SamplingFlags flags) {
+  return StartSamplingHeapProfiler(sample_interval, stack_depth, flags,
+                                   nullptr);
 }
 
 bool HeapProfiler::StartSamplingHeapProfiler(

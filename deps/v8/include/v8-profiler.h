@@ -451,30 +451,37 @@ class V8_EXPORT CpuProfilingOptions {
    * \param filter_context If specified, profiles will only contain frames
    *                       using this context. Other frames will be elided.
    * \param profile_source Identifies the source of this CPU profile.
-   * \param sample_context_extractor Optional embedder callback invoked as each
-   *                                 sample is captured. The returned pointer
-   *                                 is stored on the sample and retrievable
-   *                                 via CpuProfile::GetSampleContext. See
-   *                                 SampleContextExtractor for the
-   *                                 signal-safety contract.
    */
+  // Original constructor. Kept as its own overload so the v26.x mangled
+  // symbol stays available to already-built native addons.
   CpuProfilingOptions(
       CpuProfilingMode mode = kLeafNodeLineNumbers,
       unsigned max_samples = kNoSampleLimit, int sampling_interval_us = 0,
       MaybeLocal<Context> filter_context = MaybeLocal<Context>(),
-      CpuProfileSource profile_source = CpuProfileSource::kUnspecified,
-      SampleContextExtractor sample_context_extractor = nullptr);
+      CpuProfileSource profile_source = CpuProfileSource::kUnspecified);
 
-  CpuProfilingOptions(CpuProfilingOptions&&) = default;
-  CpuProfilingOptions& operator=(CpuProfilingOptions&&) = default;
+  /**
+   * Same as the constructor above, and installs |sample_context_extractor|.
+   * The callback is invoked as each sample is captured. The returned pointer
+   * is stored on the sample and retrievable via CpuProfile::GetSampleContext.
+   * See SampleContextExtractor for the signal-safety contract.
+   */
+  CpuProfilingOptions(CpuProfilingMode mode, unsigned max_samples,
+                      int sampling_interval_us,
+                      MaybeLocal<Context> filter_context,
+                      CpuProfileSource profile_source,
+                      SampleContextExtractor sample_context_extractor);
+
+  CpuProfilingOptions(CpuProfilingOptions&& other);
+  CpuProfilingOptions& operator=(CpuProfilingOptions&& other);
+  ~CpuProfilingOptions();
 
   CpuProfilingMode mode() const { return mode_; }
   unsigned max_samples() const { return max_samples_; }
   int sampling_interval_us() const { return sampling_interval_us_; }
   CpuProfileSource profile_source() const { return profile_source_; }
-  SampleContextExtractor sample_context_extractor() const {
-    return sample_context_extractor_;
-  }
+  // Not a data member: see the comment on the fields below.
+  SampleContextExtractor sample_context_extractor() const;
 
  private:
   friend class internal::CpuProfile;
@@ -482,12 +489,15 @@ class V8_EXPORT CpuProfilingOptions {
   bool has_filter_context() const { return !filter_context_.IsEmpty(); }
   void* raw_filter_context() const;
 
+  // Layout is frozen at the v26.8.1 size. Native addons allocate this object
+  // themselves and move it with the move operations compiled into them, so a
+  // new member would be a buffer overrun. The extractor lives in a side table
+  // keyed by this object's address (see api.cc).
   CpuProfilingMode mode_;
   unsigned max_samples_;
   int sampling_interval_us_;
   Global<Context> filter_context_;
   CpuProfileSource profile_source_;
-  SampleContextExtractor sample_context_extractor_ = nullptr;
 };
 
 /**
@@ -914,16 +924,18 @@ class V8_EXPORT AllocationProfile {
   virtual Node* GetRootNode() = 0;
   virtual const std::vector<Sample>& GetSamples() = 0;
 
+  virtual ~AllocationProfile() = default;
+
   /**
    * Returns the embedder-supplied sample context for GetSamples()[index]. The
    * pointer was produced by the SampleContextExtractor passed to
    * HeapProfiler::StartSamplingHeapProfiler. Returns nullptr if no extractor
    * was installed, the extractor returned nullptr for this sample, or the
    * index is out of range.
+   *
+   * Declared after the existing virtuals so v26.x vtable slots do not move.
    */
   virtual void* GetSampleContext(size_t index) const { return nullptr; }
-
-  virtual ~AllocationProfile() = default;
 
   static const int kNoLineNumberInfo = Message::kNoLineNumberInfo;
   static const int kNoColumnNumberInfo = Message::kNoColumnInfo;
@@ -1331,21 +1343,29 @@ class V8_EXPORT HeapProfiler {
    * Objects allocated before the sampling is started will not be included in
    * the profile.
    *
-   * If |sample_context_extractor| is set, it is called once for each sampled
-   * allocation and its result is retrievable via
+   * Returns false if a sampling heap profiler is already running.
+   */
+  // Original 3-parameter function. Kept so the v26.x mangled symbol still
+  // exists; the extractor is a separate overload rather than a defaulted
+  // parameter.
+  bool StartSamplingHeapProfiler(uint64_t sample_interval = 512 * 1024,
+                                 int stack_depth = 16,
+                                 SamplingFlags flags = kSamplingNoFlags);
+
+  /**
+   * Same as the 3-parameter StartSamplingHeapProfiler, and installs
+   * |sample_context_extractor|. If it is set, it is called once for each
+   * sampled allocation and its result is retrievable via
    * AllocationProfile::GetSampleContext. Unlike a CPU profiler extractor, it
    * runs on the isolate's thread while the allocation is being sampled, with
    * garbage collection disallowed. It may create local handles in the current
    * HandleScope, but it MUST NOT run JavaScript, allocate on the V8 heap, or
    * start or stop the sampling heap profiler. It does not need to be
    * async-signal-safe. The returned pointer is not dereferenced by V8.
-   *
-   * Returns false if a sampling heap profiler is already running.
    */
   bool StartSamplingHeapProfiler(
-      uint64_t sample_interval = 512 * 1024, int stack_depth = 16,
-      SamplingFlags flags = kSamplingNoFlags,
-      SampleContextExtractor sample_context_extractor = nullptr);
+      uint64_t sample_interval, int stack_depth, SamplingFlags flags,
+      SampleContextExtractor sample_context_extractor);
 
   /**
    * Stops the sampling heap profile and discards the current profile.
