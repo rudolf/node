@@ -11611,8 +11611,9 @@ struct SampleContextExtractorTable {
 };
 
 SampleContextExtractorTable& sample_context_extractors() {
-  static SampleContextExtractorTable table;
-  return table;
+  // Never destroyed: options may still be destroyed during process exit.
+  static SampleContextExtractorTable* table = new SampleContextExtractorTable();
+  return *table;
 }
 
 void RegisterSampleContextExtractor(const CpuProfilingOptions* self,
